@@ -66,6 +66,33 @@ To apply the series to a kernel checkout manually:
 git am /path/to/su/patches/*.patch
 ```
 
+## Project status and tested systems
+
+This is an experimental patch series, not an upstream or distribution-supported
+Speakup release. It has been built and tested on these x86-64 systems:
+
+- Arch Linux `7.1.8-arch1-3`.
+- Debian sid (unstable) `7.2.7+deb14-amd64`, package version `7.2.7-1`.
+
+Other kernel releases and distribution patch sets are untested. A successful
+build does not by itself establish that the modules are safe to load on an
+untested kernel.
+
+Loading these modules requires the distribution Speakup core to be modular
+(`CONFIG_SPEAKUP=m`). If `CONFIG_SPEAKUP=y`, Speakup is built into the kernel
+and cannot be unloaded or replaced without booting a kernel built with the
+patches. Check the running kernel configuration with one of:
+
+```sh
+grep '^CONFIG_SPEAKUP=' "/boot/config-$(uname -r)"
+zgrep '^CONFIG_SPEAKUP=' /proc/config.gz
+```
+
+The modules are unsigned. A kernel enforcing Secure Boot module signatures
+will refuse to load them unless the user signs them with a key trusted by that
+system or disables signature enforcement. Signing and key enrollment are
+distribution-specific.
+
 ## Build patched modules
 
 `build.sh` builds patched modules for the running x86-64 kernel:
@@ -112,6 +139,49 @@ The source checkout is kept pristine. The script copies only the files needed
 by the patch series and the Speakup Kbuild into a temporary kernel-shaped tree,
 applies the patches there, and performs an out-of-tree module build against
 the exact installed ABI metadata.
+
+## Load the modules for testing
+
+Do this only from a recoverable session. Unloading Speakup interrupts speech,
+and a failed replacement can leave the console without speech until the stock
+modules are loaded again or the system is rebooted. Do not configure the
+experimental modules to load at boot until they have worked interactively.
+
+First unload the stock software synthesizer and core. Any other synthesizer
+module using the stock core must also be unloaded:
+
+```sh
+sudo modprobe -r speakup_soft speakup
+```
+
+Then load the patched core before its software synthesizer, using the output
+directory printed by `build.sh`:
+
+```sh
+sudo insmod "build/modules/$(uname -r)/speakup.ko"
+sudo insmod "build/modules/$(uname -r)/speakup_soft.ko"
+```
+
+The builder does not install the patched modules or replace the stock modules
+on disk. Do not load the stock and patched Speakup cores at the same time; they
+compete for the same subsystem resources. This build does not provide patched
+hardware-synthesizer modules, and stock synthesizer modules are not supported
+with the patched core because the series changes exported Speakup interfaces.
+
+To return to the stock software synthesizer:
+
+```sh
+sudo rmmod speakup_soft speakup
+sudo modprobe speakup_soft
+```
+
+A reboot also returns to the stock modules unless the experimental modules
+have been copied into the system module tree or added to boot configuration.
+
+When reporting a problem, include the complete build or module-loading error,
+`uname -a`, the distribution and kernel package version, the values of
+`CONFIG_SPEAKUP` and `CONFIG_MODVERSIONS`, relevant `modinfo` output, and
+whether Secure Boot is enabled.
 
 ## Mainline compatibility
 
