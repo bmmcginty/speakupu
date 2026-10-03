@@ -1,8 +1,10 @@
 # Speakup Unicode patches
 
-This repository contains a twelve-patch series that lets Speakup carry full
-Unicode, including four-byte code points. Coverage includes Basic Multilingual
-Plane Chinese and supplementary characters such as U+20000.
+Speakup is the Linux kernel's screen reader for text consoles. This repository
+contains a twelve-patch series that lets it preserve and speak Unicode scalar
+values throughout its speech and screen-review paths, including four-byte code
+points. Coverage includes Basic Multilingual Plane Chinese and supplementary
+characters such as U+20000.
 
 `patches/` holds the patches in `git format-patch` form. Apply them in filename
 order; each patch expects the patches before it. Every patch builds on its own,
