@@ -276,3 +276,10 @@ The series currently targets the stable kernel source corresponding to the
 installed distribution kernel. Mainline replaced every `(u_short *)` cast in
 `main.c` with `(u16 *)`. Those casts occur as hunk context in seven patches, so
 the series must be rebased before it can be applied to current mainline.
+
+## License
+
+Original work in this repository is licensed under the GNU General Public
+License, version 2 or (at your option) any later version. See `LICENSE`. The
+patches contain context from the Linux kernel; the kernel's licensing terms
+continue to apply to that upstream-derived material.
