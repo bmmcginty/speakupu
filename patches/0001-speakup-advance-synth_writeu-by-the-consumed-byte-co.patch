@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:19:32 -0400
+Subject: [PATCH 01/12] speakup: advance synth_writeu by the consumed byte
+ count
+
+`synth_utf8_get` reports in `*consumed` how many bytes of the input it
+took for one character.  `synth_writeu` ignored `consumed` and advanced
+its index by one byte per iteration, so `synth_writeu` called
+`synth_utf8_get` again on the first continuation byte of every
+multi-byte sequence.
+
+A continuation byte has the bit pattern 0x80, for which
+`synth_utf8_get` computes `nbytes == 1`, returns -1 and reports
+`*consumed == 1`.  Each continuation byte therefore cost one extra
+`synth_utf8_get` call that produced no character.  `devsynth.c` already
+advances its index by `consumed` in `speakup_file_writeu`.
+
+`synth_utf8_get` reports `*consumed == 0` only when the input holds an
+incomplete sequence, and `synth_writeu` sets `count = i` on that path,
+so the loop still terminates.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/synth.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/accessibility/speakup/synth.c b/drivers/accessibility/speakup/synth.c
+index d8addbf..3e42977 100644
+--- a/drivers/accessibility/speakup/synth.c
++++ b/drivers/accessibility/speakup/synth.c
+@@ -281,7 +281,7 @@ void synth_writeu(const char *buf, size_t count)
+ 	size_t i, consumed, want;
+ 
+ 	/* Convert to u16 */
+-	for (i = 0; i < count; i++) {
++	for (i = 0; i < count; i += consumed) {
+ 		s32 value;
+ 
+ 		value = synth_utf8_get(buf + i, count - i, &consumed, &want);

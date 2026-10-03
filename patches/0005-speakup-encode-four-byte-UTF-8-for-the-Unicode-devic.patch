@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:22:49 -0400
+Subject: [PATCH 05/12] speakup: encode four-byte UTF-8 for the Unicode devices
+
+The two places that encode UTF-8 for a consumer handled at most three
+bytes, which covers the Basic Multilingual Plane only.  A code point
+above U+FFFF now reaches both places and needs a four-byte sequence.
+
+`softsynthx_read` serves `/dev/softsynthu`, and `spk_ttyio_out_unicode`
+serves a synth driver that selected `spk_do_catch_up_unicode`.  Give
+both a four-byte branch.
+
+`softsynthx_read` also reserved three bytes per character in
+`bytes_per_ch` and must now reserve four, so a `read()` on
+`/dev/softsynthu` with a `count` of 3 returns -EINVAL where such a
+`read()` previously succeeded.  espeakup requests far more than four
+bytes per read, so no in-tree consumer is affected.
+
+Both places substitute U+FFFD for a value that is not a Unicode scalar
+value.  `synth_utf8_get` already rejects such a value on input, so the
+substitution guards against a synth driver or a kernel caller that
+reaches `synth_buffer_add` by another route, rather than emitting an
+invalid UTF-8 sequence to userspace.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/speakup_soft.c | 28 +++++++++++++++++---
+ drivers/accessibility/speakup/spk_ttyio.c    | 14 +++++++++-
+ 2 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/accessibility/speakup/speakup_soft.c b/drivers/accessibility/speakup/speakup_soft.c
+index 07fefdd..dbe11c2 100644
+--- a/drivers/accessibility/speakup/speakup_soft.c
++++ b/drivers/accessibility/speakup/speakup_soft.c
+@@ -221,7 +221,7 @@ static ssize_t softsynthx_read(struct file *fp, char __user *buf, size_t count,
+ 	int chars_sent = 0;
+ 	char __user *cp;
+ 	char *init;
+-	size_t bytes_per_ch = unicode ? 3 : 1;
++	size_t bytes_per_ch = unicode ? 4 : 1;
+ 	u32 ch;
+ 	int empty;
+ 	unsigned long flags;
+@@ -257,7 +257,7 @@ static ssize_t softsynthx_read(struct file *fp, char __user *buf, size_t count,
+ 	cp = buf;
+ 	init = get_initstring();
+ 
+-	/* Keep 3 bytes available for a 16bit UTF-8-encoded character */
++	/* Keep four bytes available for a UTF-8-encoded Unicode scalar. */
+ 	while (chars_sent <= count - bytes_per_ch) {
+ 		if (synth_current() != &synth_soft)
+ 			break;
+@@ -275,6 +275,15 @@ static ssize_t softsynthx_read(struct file *fp, char __user *buf, size_t count,
+ 		}
+ 		spin_unlock_irqrestore(&speakup_info.spinlock, flags);
+ 
++		/*
++		 * A synth driver may have been handed a value that is not a
++		 * Unicode scalar value, so substitute the replacement
++		 * character rather than emit an invalid UTF-8 sequence.
++		 */
++		if (unicode && ((ch >= 0xd800 && ch <= 0xdfff) ||
++				ch > 0x10ffff))
++			ch = 0xfffd;
++
+ 		if ((!unicode && ch < 0x100) || (unicode && ch < 0x80)) {
+ 			u_char c = ch;
+ 
+@@ -294,13 +303,26 @@ static ssize_t softsynthx_read(struct file *fp, char __user *buf, size_t count,
+ 
+ 			chars_sent += sizeof(s);
+ 			cp += sizeof(s);
+-		} else if (unicode) {
++		} else if (unicode && ch < 0x10000) {
+ 			u_char s[3] = {
+ 				0xe0 | (ch >> 12),
+ 				0x80 | ((ch >> 6) & 0x3f),
+ 				0x80 | (ch & 0x3f)
+ 			};
+ 
++			if (copy_to_user(cp, s, sizeof(s)))
++				return -EFAULT;
++
++			chars_sent += sizeof(s);
++			cp += sizeof(s);
++		} else if (unicode) {
++			u_char s[4] = {
++				0xf0 | (ch >> 18),
++				0x80 | ((ch >> 12) & 0x3f),
++				0x80 | ((ch >> 6) & 0x3f),
++				0x80 | (ch & 0x3f)
++			};
++
+ 			if (copy_to_user(cp, s, sizeof(s)))
+ 				return -EFAULT;
+ 
+diff --git a/drivers/accessibility/speakup/spk_ttyio.c b/drivers/accessibility/speakup/spk_ttyio.c
+index 3165447..b80501c 100644
+--- a/drivers/accessibility/speakup/spk_ttyio.c
++++ b/drivers/accessibility/speakup/spk_ttyio.c
+@@ -254,15 +254,27 @@ static int spk_ttyio_out_unicode(struct spk_synth *in_synth, u32 ch)
+ {
+ 	int ret;
+ 
++	/*
++	 * A value that is not a Unicode scalar value has no UTF-8 encoding,
++	 * so send the replacement character in place of one.
++	 */
++	if ((ch >= 0xd800 && ch <= 0xdfff) || ch > 0x10ffff)
++		ch = 0xfffd;
++
+ 	if (ch < 0x80) {
+ 		ret = spk_ttyio_out(in_synth, ch);
+ 	} else if (ch < 0x800) {
+ 		ret  = spk_ttyio_out(in_synth, 0xc0 | (ch >> 6));
+ 		ret &= spk_ttyio_out(in_synth, 0x80 | (ch & 0x3f));
+-	} else {
++	} else if (ch < 0x10000) {
+ 		ret  = spk_ttyio_out(in_synth, 0xe0 | (ch >> 12));
+ 		ret &= spk_ttyio_out(in_synth, 0x80 | ((ch >> 6) & 0x3f));
+ 		ret &= spk_ttyio_out(in_synth, 0x80 | (ch & 0x3f));
++	} else {
++		ret  = spk_ttyio_out(in_synth, 0xf0 | (ch >> 18));
++		ret &= spk_ttyio_out(in_synth, 0x80 | ((ch >> 12) & 0x3f));
++		ret &= spk_ttyio_out(in_synth, 0x80 | ((ch >> 6) & 0x3f));
++		ret &= spk_ttyio_out(in_synth, 0x80 | (ch & 0x3f));
+ 	}
+ 	return ret;
+ }

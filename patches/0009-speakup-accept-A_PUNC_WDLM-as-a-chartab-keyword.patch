@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:27:14 -0400
+Subject: [PATCH 09/12] speakup: accept A_PUNC_WDLM as a chartab keyword
+
+A punctuation mark that ends a word needs both A_PUNC and B_WDLM.
+A_PUNC names a mark that Speakup announces at punctuation level "all",
+and B_WDLM names a mark that ends a word.  No keyword named the
+combination, so `/sys/accessibility/speakup/i18n/chartab` could not set
+it and could not report it.
+
+Add the keyword A_PUNC_WDLM.  `spk_chartab_get_value` accepts it, so a
+write to `chartab` can now set the combination for a Latin-1 code point
+as well.
+
+Move the class-naming chain out of `chars_chartab_show` into
+`spk_chartab_keyword`, which takes a chartab value rather than a Latin-1
+index.  The chain tested `IS_TYPE(i, ...)`, which indexes
+`spk_chartab[]` and therefore only ever worked for a Latin-1 index.
+
+`spk_chartab_keyword` tests A_PUNC_WDLM before WDLM, because A_PUNC_WDLM
+contains WDLM and the broader name has to win.  No entry in
+`default_chartab` carries both A_PUNC and B_WDLM, so this reordering
+changes nothing that `chartab` reports by default, and changes what
+`chartab` reports only for a value that a reader sets with the new
+keyword.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/kobjects.c    | 47 ++++++++++++---------
+ drivers/accessibility/speakup/speakup.h     |  1 +
+ drivers/accessibility/speakup/varhandlers.c |  2 +
+ 3 files changed, 30 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/accessibility/speakup/kobjects.c b/drivers/accessibility/speakup/kobjects.c
+index 0dfdb66..a692589 100644
+--- a/drivers/accessibility/speakup/kobjects.c
++++ b/drivers/accessibility/speakup/kobjects.c
+@@ -23,6 +23,32 @@
+ #include "speakup.h"
+ #include "spk_priv.h"
+ 
++/* Name the character class that a chartab value holds. */
++static char *spk_chartab_keyword(u_short type)
++{
++	if ((type & B_CTL) == B_CTL)
++		return "B_CTL";
++	if ((type & A_PUNC_WDLM) == A_PUNC_WDLM)
++		return "A_PUNC_WDLM";
++	if ((type & WDLM) == WDLM)
++		return "WDLM";
++	if ((type & A_PUNC) == A_PUNC)
++		return "A_PUNC";
++	if ((type & PUNC) == PUNC)
++		return "PUNC";
++	if ((type & NUM) == NUM)
++		return "NUM";
++	if ((type & A_CAP) == A_CAP)
++		return "A_CAP";
++	if ((type & ALPHA) == ALPHA)
++		return "ALPHA";
++	if ((type & B_CAPSYM) == B_CAPSYM)
++		return "B_CAPSYM";
++	if ((type & B_SYM) == B_SYM)
++		return "B_SYM";
++	return "0";
++}
++
+ /*
+  * This is called when a user reads the characters or chartab sys file.
+  */
+@@ -45,26 +71,7 @@ static ssize_t chars_chartab_show(struct kobject *kobj,
+ 			len = scnprintf(buf_pointer, bufsize, "%d\t%s\n",
+ 					i, spk_characters[i]);
+ 		} else {	/* show chartab entry */
+-			if (IS_TYPE(i, B_CTL))
+-				cp = "B_CTL";
+-			else if (IS_TYPE(i, WDLM))
+-				cp = "WDLM";
+-			else if (IS_TYPE(i, A_PUNC))
+-				cp = "A_PUNC";
+-			else if (IS_TYPE(i, PUNC))
+-				cp = "PUNC";
+-			else if (IS_TYPE(i, NUM))
+-				cp = "NUM";
+-			else if (IS_TYPE(i, A_CAP))
+-				cp = "A_CAP";
+-			else if (IS_TYPE(i, ALPHA))
+-				cp = "ALPHA";
+-			else if (IS_TYPE(i, B_CAPSYM))
+-				cp = "B_CAPSYM";
+-			else if (IS_TYPE(i, B_SYM))
+-				cp = "B_SYM";
+-			else
+-				cp = "0";
++			cp = spk_chartab_keyword(spk_chartab[i]);
+ 			len =
+ 			    scnprintf(buf_pointer, bufsize, "%d\t%s\n", i, cp);
+ 		}
+diff --git a/drivers/accessibility/speakup/speakup.h b/drivers/accessibility/speakup/speakup.h
+index 983e5e5..fdf7c99 100644
+--- a/drivers/accessibility/speakup/speakup.h
++++ b/drivers/accessibility/speakup/speakup.h
+@@ -28,6 +28,7 @@
+ #define A_PUNC 0x0041
+ #define B_WDLM 0x0080
+ #define WDLM 0x0081
++#define A_PUNC_WDLM (A_PUNC | B_WDLM)
+ #define B_EXNUM 0x0100
+ #define CH_RPT 0x0200
+ #define B_CTL 0x0400
+diff --git a/drivers/accessibility/speakup/varhandlers.c b/drivers/accessibility/speakup/varhandlers.c
+index 462f8d8..b0eb136 100644
+--- a/drivers/accessibility/speakup/varhandlers.c
++++ b/drivers/accessibility/speakup/varhandlers.c
+@@ -71,6 +71,8 @@ int spk_chartab_get_value(char *keyword)
+ 		value = ALPHA;
+ 	else if (!strcmp(keyword, "B_CTL"))
+ 		value = B_CTL;
++	else if (!strcmp(keyword, "A_PUNC_WDLM"))
++		value = A_PUNC_WDLM;
+ 	else if (!strcmp(keyword, "WDLM"))
+ 		value = WDLM;
+ 	else if (!strcmp(keyword, "A_PUNC"))

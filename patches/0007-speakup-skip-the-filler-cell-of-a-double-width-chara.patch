@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:24:24 -0400
+Subject: [PATCH 07/12] speakup: skip the filler cell of a double-width
+ character
+
+A Chinese character occupies two screen columns.  The console writes the
+character into the first of two cells and stores U+200B, a zero-width
+space, in the Unicode screen buffer for the second cell.
+
+Speakup keeps one review buffer entry per screen cell, because a review
+buffer index has to equal a screen column for `spk_x` and `spk_pos` to
+stay consistent.  The zero-width space therefore reaches the review
+buffers, and Speakup spoke the zero-width space as a separate character.
+
+Name the zero-width space `SPK_UC_WIDE_FILL` and drop it at the point
+where speech is produced:
+
+  get_char_at_cursor  reports the double-width character when the
+                      reading cursor points at the second cell
+  say_prev_char       steps over a filler cell when moving left
+  say_next_char       steps over a filler cell when moving right
+  say_last_char       steps back from a filler cell at end of line
+  spell_word          skips a filler cell
+  spkup_write         skips a filler cell without disturbing the repeat
+                      counter or the punctuation state
+
+`say_char`, `say_phonetic_char` and `say_char_num` read through
+`get_char_at_cursor`, so all three report the double-width character
+from either of its two cells.
+
+`spkup_write` drops the filler cell with a `continue`, which leaves
+`old_ch` and `last_type` pointing at the preceding double-width
+character and leaves `in_count` counting the filler cell, so the repeat
+counter and the trailing repeat announcement behave as before.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/main.c | 71 ++++++++++++++++++++++++++--
+ 1 file changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/accessibility/speakup/main.c b/drivers/accessibility/speakup/main.c
+index b54b859..245fc46 100644
+--- a/drivers/accessibility/speakup/main.c
++++ b/drivers/accessibility/speakup/main.c
+@@ -454,6 +454,15 @@ static void speak_char(u32 ch)
+ 	}
+ }
+ 
++/*
++ * The console writes a double-width character into the first of two screen
++ * cells and stores a zero-width space in the Unicode screen buffer for the
++ * second cell.  Speakup keeps one review buffer entry per screen cell so that
++ * review buffer indexes stay equal to screen columns, so the zero-width space
++ * is carried through the review buffers and dropped when speech is produced.
++ */
++#define SPK_UC_WIDE_FILL 0x200b
++
+ static u32 get_char(struct vc_data *vc, u16 *pos, u_char *attribs)
+ {
+ 	u32 ch = ' ';
+@@ -480,12 +489,32 @@ static u32 get_char(struct vc_data *vc, u16 *pos, u_char *attribs)
+ 	return ch;
+ }
+ 
++/*
++ * Read the character that the reading cursor points at.  When the reading
++ * cursor points at the second cell of a double-width character, report the
++ * double-width character itself rather than the zero-width space that the
++ * console stored in the second cell.
++ */
++static u32 get_char_at_cursor(struct vc_data *vc, u_long pos, u_char *attribs)
++{
++	u32 ch = get_char(vc, (u_short *)pos, attribs);
++	u_char previous_attribs;
++
++	if (ch != SPK_UC_WIDE_FILL)
++		return ch;
++	if (pos < vc->vc_origin + 2)
++		return ch;
++	if ((pos - vc->vc_origin) % vc->vc_size_row == 0)
++		return ch;
++	return get_char(vc, (u_short *)(pos - 2), &previous_attribs);
++}
++
+ static void say_char(struct vc_data *vc)
+ {
+ 	u32 ch;
+ 
+ 	spk_old_attr = spk_attr;
+-	ch = get_char(vc, (u_short *)spk_pos, &spk_attr);
++	ch = get_char_at_cursor(vc, spk_pos, &spk_attr);
+ 	if (spk_attr != spk_old_attr) {
+ 		if (spk_attrib_bleep & 1)
+ 			bleep(spk_y);
+@@ -500,7 +529,7 @@ static void say_phonetic_char(struct vc_data *vc)
+ 	u32 ch;
+ 
+ 	spk_old_attr = spk_attr;
+-	ch = get_char(vc, (u_short *)spk_pos, &spk_attr);
++	ch = get_char_at_cursor(vc, spk_pos, &spk_attr);
+ 	if (ch <= 0x7f && isalpha(ch)) {
+ 		ch &= 0x1f;
+ 		synth_printf("%s\n", phonetic[--ch]);
+@@ -513,6 +542,8 @@ static void say_phonetic_char(struct vc_data *vc)
+ 
+ static void say_prev_char(struct vc_data *vc)
+ {
++	u_char attribs;
++
+ 	spk_parked |= 0x01;
+ 	if (spk_x == 0) {
+ 		announce_edge(vc, edge_left);
+@@ -520,11 +551,22 @@ static void say_prev_char(struct vc_data *vc)
+ 	}
+ 	spk_x--;
+ 	spk_pos -= 2;
++	/*
++	 * Moving left onto the second cell of a double-width character must
++	 * continue to the first cell of that double-width character.
++	 */
++	if (spk_x > 0 &&
++	    get_char(vc, (u_short *)spk_pos, &attribs) == SPK_UC_WIDE_FILL) {
++		spk_x--;
++		spk_pos -= 2;
++	}
+ 	say_char(vc);
+ }
+ 
+ static void say_next_char(struct vc_data *vc)
+ {
++	u_char attribs;
++
+ 	spk_parked |= 0x01;
+ 	if (spk_x == vc->vc_cols - 1) {
+ 		announce_edge(vc, edge_right);
+@@ -532,6 +574,15 @@ static void say_next_char(struct vc_data *vc)
+ 	}
+ 	spk_x++;
+ 	spk_pos += 2;
++	/*
++	 * Moving right onto the second cell of a double-width character must
++	 * continue to the first cell of the next character.
++	 */
++	if (spk_x < vc->vc_cols - 1 &&
++	    get_char(vc, (u_short *)spk_pos, &attribs) == SPK_UC_WIDE_FILL) {
++		spk_x++;
++		spk_pos += 2;
++	}
+ 	say_char(vc);
+ }
+ 
+@@ -714,6 +765,10 @@ static void spell_word(struct vc_data *vc)
+ 	if (!get_word(vc))
+ 		return;
+ 	while ((ch = *cp)) {
++		if (ch == SPK_UC_WIDE_FILL) {
++			cp++;
++			continue;
++		}
+ 		if (cp != buf)
+ 			synth_printf(" %s ", delay_str[spk_spell_delay]);
+ 		/* FIXME: Non-latin1 considered as lower case */
+@@ -1033,6 +1088,8 @@ static void say_last_char(struct vc_data *vc)
+ 		return;
+ 	}
+ 	ch = buf[--len];
++	if (ch == SPK_UC_WIDE_FILL && len > 0)
++		ch = buf[--len];
+ 	spk_pos -= (spk_x - len) * 2;
+ 	spk_x = len;
+ 	synth_printf("%d, ", ++len);
+@@ -1050,7 +1107,7 @@ static void say_position(struct vc_data *vc)
+ static void say_char_num(struct vc_data *vc)
+ {
+ 	u_char tmp;
+-	u32 ch = get_char(vc, (u_short *)spk_pos, &tmp);
++	u32 ch = get_char_at_cursor(vc, spk_pos, &tmp);
+ 
+ 	synth_printf(spk_msg_get(MSG_CHAR_INFO), ch, ch);
+ }
+@@ -1095,6 +1152,14 @@ static void spkup_write(const u32 *in_buf, int count)
+ 				synth_insert_next_index(currsentence++);
+ 		}
+ 		ch = *in_buf++;
++		/*
++		 * The second cell of a double-width character carries no
++		 * speech of its own.  Dropping the zero-width space here keeps
++		 * the repeat counter and the punctuation state attached to the
++		 * preceding double-width character.
++		 */
++		if (ch == SPK_UC_WIDE_FILL)
++			continue;
+ 		if (ch < 0x100)
+ 			char_type = spk_chartab[ch];
+ 		else

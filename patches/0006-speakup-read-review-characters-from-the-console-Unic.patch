@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:23:26 -0400
+Subject: [PATCH 06/12] speakup: read review characters from the console
+ Unicode screen buffer
+
+`get_char` reconstructed a character from the glyph index stored in the
+screen cell, by masking the cell to eight bits, folding in the ninth bit
+from `vc_hi_font_mask` and calling `inverse_translate`.  A glyph index
+identifies a font position, and a console font holds at most 512 glyphs,
+so the reconstruction cannot distinguish two code points that the loaded
+font maps to one glyph and cannot represent a code point outside the
+font at all.
+
+Call `screen_glyph_unicode` instead.  The virtual terminal keeps a
+Unicode screen buffer holding the true code point of each cell, and
+`screen_glyph_unicode` returns that code point.
+
+A console that holds no Unicode screen buffer is unaffected, because
+`screen_glyph_unicode` then falls back to
+`inverse_translate(vc, screen_glyph(vc, n * 2), true)`, and
+`screen_glyph` applies `vc_hi_font_mask` to build the same nine-bit
+glyph index that `get_char` built before this commit.
+
+The virtual terminal allocates the Unicode screen buffer on demand.
+`vc_uniscr_check` allocates the Unicode screen buffer when a process
+reads `/dev/vcsu`, and when the console displays a double-width or
+zero-width character, and refuses to allocate the Unicode screen buffer
+when the console is not in UTF-8 mode.
+
+Add a bounds check on the cell index as well.  `get_char` is called with
+a position derived from `spk_pos`, and a caller that walks off the
+screen previously read a cell outside the console.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/main.c | 23 +++++++++++++----------
+ 1 file changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/accessibility/speakup/main.c b/drivers/accessibility/speakup/main.c
+index 2f45782..b54b859 100644
+--- a/drivers/accessibility/speakup/main.c
++++ b/drivers/accessibility/speakup/main.c
+@@ -459,20 +459,23 @@ static u32 get_char(struct vc_data *vc, u16 *pos, u_char *attribs)
+ 	u32 ch = ' ';
+ 
+ 	if (vc && pos) {
++		long cell = pos - (u16 *)vc->vc_origin;
+ 		u16 w;
+-		u16 c;
+ 
+-		pos = screen_pos(vc, pos - (u16 *)vc->vc_origin, true);
+-		w = scr_readw(pos);
+-		c = w & 0xff;
++		if (cell < 0 || cell >= (long)vc->vc_rows * vc->vc_cols)
++			return ch;
+ 
+-		if (w & vc->vc_hi_font_mask) {
+-			w &= ~vc->vc_hi_font_mask;
+-			c |= 0x100;
+-		}
+-
+-		ch = inverse_translate(vc, c, true);
++		w = scr_readw(screen_pos(vc, cell, true));
++		w &= ~vc->vc_hi_font_mask;
+ 		*attribs = (w & 0xff00) >> 8;
++
++		/*
++		 * screen_glyph_unicode() returns the true code point when the
++		 * console keeps a Unicode screen buffer.  When the console
++		 * keeps no Unicode screen buffer, screen_glyph_unicode()
++		 * back-translates the glyph exactly as Speakup did before.
++		 */
++		ch = screen_glyph_unicode(vc, cell);
+ 	}
+ 	return ch;
+ }

@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:28:07 -0400
+Subject: [PATCH 10/12] speakup: expose the extended character table through
+ sysfs
+
+The extended character table has no reader-visible interface, so a code
+point it does not already describe cannot be named without a kernel
+change.  Chinese is only one script, and every other script has
+punctuation that a speech synthesizer renders as silence too.
+
+Add `/sys/accessibility/speakup/i18n/ext_characters` for descriptions and
+`/sys/accessibility/speakup/i18n/ext_chartab` for class bits.  Both files
+mirror the existing `characters` and `chartab` files, including the reset
+that a write beginning with `d`, `D`, `r`, `R` or a newline performs, and
+both report through the existing `report_char_chartab_status`.
+
+Both new files address a character by hexadecimal code point rather than
+by decimal index, because a code point is conventionally written in
+hexadecimal and because the table is sparse.  The Latin-1 `characters`
+and `chartab` files already fill most of a page, which is why the code
+points above Latin-1 need files of their own rather than more lines in
+the existing two files.
+
+A write to either new file adds a code point that the table does not yet
+describe, so naming a character and classifying it are independent
+operations and can be performed in either order.
+
+Document both files in `spkguide.txt`: add them to the listing of the
+i18n subdirectory, add a section 12.1 that works through naming and
+classifying U+3002 as an example, and add an entry for each file to the
+list in section 14.1.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ Documentation/admin-guide/spkguide.txt   |  53 ++++++++
+ drivers/accessibility/speakup/kobjects.c | 162 +++++++++++++++++++++++
+ 2 files changed, 215 insertions(+)
+
+diff --git a/Documentation/admin-guide/spkguide.txt b/Documentation/admin-guide/spkguide.txt
+index 0d59651..dee6e02 100644
+--- a/Documentation/admin-guide/spkguide.txt
++++ b/Documentation/admin-guide/spkguide.txt
+@@ -398,6 +398,8 @@ characters
+ chartab
+ colors
+ ctl_keys
++ext_characters
++ext_chartab
+ formatted
+ function_names
+ key_names
+@@ -903,6 +905,48 @@ cat /speakup/i18n/characters
+ Speakup will then print out the entire character pronunciation table.  I
+ won't display it here, but leave you to look at it at your convenience.
+ 
++12.1.  Characters Above Latin-1
++
++The characters and chartab files describe the first 256 characters only,
++because both files are indexed by the numeric value of the character.  Two
++further files, /speakup/i18n/ext_characters and /speakup/i18n/ext_chartab,
++describe a character whose value is 256 or greater.
++
++Both extended files address a character by its hexadecimal value rather than
++by a decimal one, because the value of such a character is conventionally
++written in hexadecimal.  Apart from the hexadecimal value, ext_characters
++works exactly like characters, and ext_chartab works exactly like chartab.
++
++For example, the following command tells Speakup to say "ideographic dot"
++for the Chinese full stop, which is character U+3002:
++
++echo 3002 ideographic dot >/speakup/i18n/ext_characters
++
++A speech synthesizer usually produces no sound at all for a punctuation mark
++from a non-Latin script, so naming the mark in ext_characters is what makes
++the mark audible when you review text one character at a time.
++
++The chartab class of a character decides when Speakup announces the name you
++gave it, and whether the character ends a word.  The following command gives
++the Chinese full stop the same class that Speakup gives the Latin full stop,
++and additionally makes the character end a word:
++
++echo 3002 A_PUNC_WDLM >/speakup/i18n/ext_chartab
++
++The A_PUNC_WDLM class matters for a script that is written without spaces,
++such as Chinese, because without a character that ends a word, the word
++navigation commands would traverse a whole line at a time.
++
++You can look at either whole table in the same way as the Latin-1 tables:
++
++cat /speakup/i18n/ext_characters
++cat /speakup/i18n/ext_chartab
++
++Writing the letter d or the letter r, or an empty line, to either extended
++file restores both extended tables to their defaults, and also discards any
++character you added yourself.  The two extended tables share their storage,
++so a reset of one is a reset of both.
++
+ 13.  Mapping Keys
+ 
+ Speakup has the capability of allowing you to assign or "map" keys to
+@@ -1011,6 +1055,15 @@ file.
+ Here, you will find names of control keys.  These are used with Speakup's
+ say_control feature.
+ 
++* ext_characters:
++See section 12.1 for a description of this file.  It does for a character
++whose value is 256 or greater what the characters file does for the first
++256 characters.
++
++* ext_chartab:
++See section 12.1.  Like chartab, and unlike the rest of the files in the
++i18n subdirectory, this one does not contain messages to be spoken.
++
+ * formatted:
+ This group of messages contains embedded formatting codes, to specify
+ the type and width of displayed data.  If you change these, you must
+diff --git a/drivers/accessibility/speakup/kobjects.c b/drivers/accessibility/speakup/kobjects.c
+index a692589..4e39136 100644
+--- a/drivers/accessibility/speakup/kobjects.c
++++ b/drivers/accessibility/speakup/kobjects.c
+@@ -230,6 +230,160 @@ static ssize_t chars_chartab_store(struct kobject *kobj,
+ 	return retval;
+ }
+ 
++/*
++ * This is called when a user reads the ext_characters or ext_chartab sys file.
++ *
++ * The Latin-1 characters and chartab files already fill most of a page, so the
++ * code points above Latin-1 need files of their own.  Both extended files
++ * address a character by its hexadecimal code point rather than by a decimal
++ * index, because a code point is conventionally written in hexadecimal.
++ */
++static ssize_t ext_chars_chartab_show(struct kobject *kobj,
++				      struct kobj_attribute *attr, char *buf)
++{
++	int i;
++	int len = 0;
++	char *cp;
++	char *buf_pointer = buf;
++	size_t bufsize = PAGE_SIZE;
++	unsigned long flags;
++	int do_characters = !strcmp(attr->attr.name, "ext_characters");
++
++	spin_lock_irqsave(&speakup_info.spinlock, flags);
++	*buf_pointer = '\0';
++	for (i = 0; i < spk_ext_chars_used; i++) {
++		if (bufsize <= 1)
++			break;
++		if (do_characters)
++			cp = spk_ext_chars[i].desc ? spk_ext_chars[i].desc : "";
++		else
++			cp = spk_chartab_keyword(spk_ext_chars[i].type);
++		len = scnprintf(buf_pointer, bufsize, "%x\t%s\n",
++				spk_ext_chars[i].ch, cp);
++		bufsize -= len;
++		buf_pointer += len;
++	}
++	spin_unlock_irqrestore(&speakup_info.spinlock, flags);
++	return buf_pointer - buf;
++}
++
++/*
++ * This is called when a user changes the ext_characters or ext_chartab
++ * parameters.  A code point the table does not yet describe is added, so a
++ * reader can name a character from any script without a kernel change.
++ */
++static ssize_t ext_chars_chartab_store(struct kobject *kobj,
++				       struct kobj_attribute *attr,
++				       const char *buf, size_t count)
++{
++	char *cp = (char *)buf;
++	char *end = cp + count; /* the null at the end of the buffer */
++	char *linefeed = NULL;
++	char keyword[MAX_DESC_LEN + 1];
++	char *desc = NULL;
++	char *temp = NULL;
++	ssize_t retval = count;
++	unsigned long flags;
++	unsigned long codepoint = 0;
++	int charclass = 0;
++	int received = 0;
++	int used = 0;
++	int rejected = 0;
++	int reset = 0;
++	int do_characters = !strcmp(attr->attr.name, "ext_characters");
++	size_t desc_length = 0;
++	int err;
++
++	spin_lock_irqsave(&speakup_info.spinlock, flags);
++	while (cp < end) {
++		while ((cp < end) && (*cp == ' ' || *cp == '\t'))
++			cp++;
++
++		if (cp == end)
++			break;
++		if ((*cp == '\n') || strchr("dDrR", *cp)) {
++			reset = 1;
++			break;
++		}
++		received++;
++
++		linefeed = strchr(cp, '\n');
++		if (!linefeed) {
++			rejected++;
++			break;
++		}
++
++		if (!isxdigit(*cp)) {
++			rejected++;
++			cp = linefeed + 1;
++			continue;
++		}
++
++		/*
++		 * Do not replace with kstrtoul:
++		 * here we need temp to be updated
++		 */
++		codepoint = simple_strtoul(cp, &temp, 16);
++		if (codepoint < 0x100 || codepoint > 0x10ffff) {
++			rejected++;
++			cp = linefeed + 1;
++			continue;
++		}
++
++		while ((temp < linefeed) && (*temp == ' ' || *temp == '\t'))
++			temp++;
++
++		desc_length = linefeed - temp;
++		if (desc_length > MAX_DESC_LEN || desc_length == 0) {
++			rejected++;
++			cp = linefeed + 1;
++			continue;
++		}
++
++		if (do_characters) {
++			desc = kmemdup_nul(temp, desc_length, GFP_ATOMIC);
++			if (!desc) {
++				retval = -ENOMEM;
++				reset = 1;	/* just reset on error. */
++				break;
++			}
++			err = spk_ext_char_set_desc(codepoint, desc);
++			if (err) {
++				kfree(desc);
++				rejected++;
++				cp = linefeed + 1;
++				continue;
++			}
++			used++;
++		} else {
++			memcpy(keyword, temp, desc_length);
++			keyword[desc_length] = '\0';
++			charclass = spk_chartab_get_value(keyword);
++			if (charclass == 0) {
++				rejected++;
++				cp = linefeed + 1;
++				continue;
++			}
++			err = spk_ext_char_set_type(codepoint, charclass);
++			if (err) {
++				rejected++;
++				cp = linefeed + 1;
++				continue;
++			}
++			used++;
++		}
++		cp = linefeed + 1;
++	}
++
++	if (reset && spk_reset_default_ext_chars())
++		retval = -ENOMEM;
++
++	spin_unlock_irqrestore(&speakup_info.spinlock, flags);
++	report_char_chartab_status(reset, received, used, rejected,
++				   do_characters);
++	return retval;
++}
++
+ /*
+  * This is called when a user reads the keymap parameter.
+  */
+@@ -932,6 +1086,12 @@ static struct kobj_attribute characters_attribute =
+ static struct kobj_attribute chartab_attribute =
+ 	__ATTR(chartab, 0644, chars_chartab_show,
+ 	       chars_chartab_store);
++static struct kobj_attribute ext_characters_attribute =
++	__ATTR(ext_characters, 0644, ext_chars_chartab_show,
++	       ext_chars_chartab_store);
++static struct kobj_attribute ext_chartab_attribute =
++	__ATTR(ext_chartab, 0644, ext_chars_chartab_show,
++	       ext_chars_chartab_store);
+ static struct kobj_attribute ctl_keys_attribute =
+ 	__ATTR(ctl_keys, 0644, message_show, message_store);
+ static struct kobj_attribute colors_attribute =
+@@ -981,6 +1141,8 @@ static struct attribute *i18n_attrs[] = {
+ 	&announcements_attribute.attr,
+ 	&characters_attribute.attr,
+ 	&chartab_attribute.attr,
++	&ext_characters_attribute.attr,
++	&ext_chartab_attribute.attr,
+ 	&ctl_keys_attribute.attr,
+ 	&colors_attribute.attr,
+ 	&formatted_attribute.attr,

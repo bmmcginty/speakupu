@@ -1,0 +1,469 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:26:36 -0400
+Subject: [PATCH 08/12] speakup: describe code points above Latin-1 with an
+ extended table
+
+`spk_chartab[]` and `spk_characters[]` are both indexed by the code
+point itself and both hold 256 entries, so neither can describe a code
+point above Latin-1.  Speakup therefore treated every such code point as
+ALPHA with no description, which is why `main.c` carried a `ch < 0x100`
+guard in front of every use of `IS_WDLM`, `IS_CHAR` and
+`spk_characters[]`.
+
+Add a second table that holds one entry per described code point at or
+above 0x100.  The table is kept sorted by code point and searched with a
+binary search, so the table costs one comparison for a Latin-1 code
+point and at most `log2(n)` comparisons for any other.
+
+`spk_char_info` returns the class bits and the description together from
+one lookup, because naming a character needs both and a second accessor
+call would repeat the search.  `spk_char_type` returns the class bits
+alone for `IS_WDLM`, `IS_CHAR` and `IS_TYPE`, whose callers each ask
+about one code point once.
+
+Rewrite the three macros to consult the new table, and delete every
+`ch < 0x100` guard that the macros made necessary.  `speak_char` and
+`spell_word` now take one lookup each instead of three and two.
+
+This commit changes no spoken output.  The default table is empty, so
+`spk_char_type` returns ALPHA and `spk_char_info.desc` returns NULL for
+every code point above Latin-1, exactly as the deleted guards arranged.
+ALPHA is 0x0003, so `ALPHA & B_WDLM`, `ALPHA & B_NUM` and
+`ALPHA & B_CAP` are all zero and every rewritten test keeps its result.
+
+The table is the first allocation in `speakup_init` that can fail, so
+the unwind path gains a label for it.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/main.c    | 239 +++++++++++++++++++++---
+ drivers/accessibility/speakup/speakup.h |  42 ++++-
+ 2 files changed, 251 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/accessibility/speakup/main.c b/drivers/accessibility/speakup/main.c
+index 245fc46..85d4e32 100644
+--- a/drivers/accessibility/speakup/main.c
++++ b/drivers/accessibility/speakup/main.c
+@@ -229,6 +229,178 @@ static u_short default_chartab[256] = {
+ 	ALPHA, ALPHA, ALPHA, ALPHA, ALPHA, ALPHA, ALPHA, ALPHA	/* 248-255 */
+ };
+ 
++/*
++ * The extended character table describes a code point at or above 0x100, which
++ * spk_chartab[] and spk_characters[] cannot describe because both are indexed
++ * by the code point itself.  The table grows because a reader can name a code
++ * point that Speakup does not already describe.  SPK_EXT_CHARS_MAX bounds how
++ * much memory such a reader can claim.
++ */
++#define SPK_EXT_CHARS_CHUNK 32
++#define SPK_EXT_CHARS_MAX 1024
++
++struct spk_ext_char *spk_ext_chars;
++int spk_ext_chars_used;
++static int spk_ext_chars_size;
++
++/* Return the index of ch in the extended character table, or -1 when absent. */
++int spk_ext_char_index(u32 ch)
++{
++	int low = 0;
++	int high = spk_ext_chars_used - 1;
++
++	if (ch < 0x100 || !spk_ext_chars)
++		return -1;
++	while (low <= high) {
++		int mid = low + (high - low) / 2;
++
++		if (spk_ext_chars[mid].ch == ch)
++			return mid;
++		if (spk_ext_chars[mid].ch < ch)
++			low = mid + 1;
++		else
++			high = mid - 1;
++	}
++	return -1;
++}
++
++/* Describe ch with a single table lookup. */
++struct spk_char_info spk_char_info(u32 ch)
++{
++	struct spk_char_info info = { .desc = NULL, .type = ALPHA };
++	int index;
++
++	if (ch < 0x100) {
++		info.desc = spk_characters[ch];
++		info.type = spk_chartab[ch];
++		return info;
++	}
++	index = spk_ext_char_index(ch);
++	if (index < 0)
++		return info;
++	info.desc = spk_ext_chars[index].desc;
++	info.type = spk_ext_chars[index].type;
++	return info;
++}
++
++/*
++ * Return only the class bits of ch, for the IS_WDLM, IS_CHAR and IS_TYPE
++ * macros.  Every caller of those macros needs the class bits alone and asks
++ * about one code point once, so no caller of those macros benefits from
++ * spk_char_info.
++ */
++u_short spk_char_type(u32 ch)
++{
++	int index;
++
++	if (ch < 0x100)
++		return spk_chartab[ch];
++	index = spk_ext_char_index(ch);
++	if (index < 0)
++		return ALPHA;
++	return spk_ext_chars[index].type;
++}
++
++/*
++ * Return the index of ch, inserting an unnamed ALPHA entry when the extended
++ * character table does not already describe ch.  Returns a negative errno when
++ * the table cannot grow.
++ */
++static int spk_ext_char_insert(u32 ch)
++{
++	struct spk_ext_char *grown;
++	int index = spk_ext_char_index(ch);
++	int i;
++
++	if (index >= 0)
++		return index;
++	if (ch < 0x100)
++		return -EINVAL;
++	if (spk_ext_chars_used >= SPK_EXT_CHARS_MAX)
++		return -ENOSPC;
++	if (spk_ext_chars_used == spk_ext_chars_size) {
++		int size = spk_ext_chars_size + SPK_EXT_CHARS_CHUNK;
++
++		grown = krealloc_array(spk_ext_chars, size,
++				       sizeof(*spk_ext_chars), GFP_ATOMIC);
++		if (!grown)
++			return -ENOMEM;
++		spk_ext_chars = grown;
++		spk_ext_chars_size = size;
++	}
++
++	/* Keep the table sorted so that spk_ext_char_index can bisect it. */
++	for (i = spk_ext_chars_used; i > 0 && spk_ext_chars[i - 1].ch > ch; i--)
++		spk_ext_chars[i] = spk_ext_chars[i - 1];
++	/*
++	 * krealloc_array does not zero the slots it adds, and the loop above
++	 * leaves a copy of a neighbouring entry in slot i, so every field has
++	 * to be assigned rather than relied on to be zero.
++	 */
++	spk_ext_chars[i].ch = ch;
++	spk_ext_chars[i].type = ALPHA;
++	spk_ext_chars[i].desc = NULL;
++	spk_ext_chars[i].desc_allocated = false;
++	spk_ext_chars_used++;
++	return i;
++}
++
++/* Takes ownership of desc, which must come from the allocator. */
++int spk_ext_char_set_desc(u32 ch, char *desc)
++{
++	int index = spk_ext_char_insert(ch);
++
++	if (index < 0)
++		return index;
++	if (spk_ext_chars[index].desc_allocated)
++		kfree(spk_ext_chars[index].desc);
++	spk_ext_chars[index].desc = desc;
++	spk_ext_chars[index].desc_allocated = true;
++	return 0;
++}
++
++int spk_ext_char_set_type(u32 ch, u_short type)
++{
++	int index = spk_ext_char_insert(ch);
++
++	if (index < 0)
++		return index;
++	spk_ext_chars[index].type = type;
++	return 0;
++}
++
++void spk_free_ext_chars(void)
++{
++	int i;
++
++	for (i = 0; i < spk_ext_chars_used; i++)
++		if (spk_ext_chars[i].desc_allocated)
++			kfree(spk_ext_chars[i].desc);
++	kfree(spk_ext_chars);
++	spk_ext_chars = NULL;
++	spk_ext_chars_used = 0;
++	spk_ext_chars_size = 0;
++}
++
++/*
++ * Descriptions and class bits share one table, so resetting either one also
++ * resets the other, and also drops any code point a reader added.
++ */
++int spk_reset_default_ext_chars(void)
++{
++	struct spk_ext_char *table;
++
++	table = kcalloc(SPK_EXT_CHARS_CHUNK, sizeof(*table), GFP_ATOMIC);
++	if (!table)
++		return -ENOMEM;
++
++	spk_free_ext_chars();
++	spk_ext_chars = table;
++	spk_ext_chars_used = 0;
++	spk_ext_chars_size = SPK_EXT_CHARS_CHUNK;
++	return 0;
++}
++
+ struct task_struct *speakup_task;
+ struct bleep spk_unprocessed_sound;
+ static int spk_keydown;
+@@ -421,26 +593,32 @@ static void announce_edge(struct vc_data *vc, enum edge msg_id)
+ 
+ static void speak_char(u32 ch)
+ {
++	struct spk_char_info info = spk_char_info(ch);
+ 	char *cp;
+ 	struct var_t *direct = spk_get_var(DIRECT);
+ 
+-	if (ch >= 0x100 || (direct && direct->u.n.value)) {
+-		if (ch < 0x100 && IS_CHAR(ch, B_CAP)) {
++	if (direct && direct->u.n.value) {
++		if (info.type & B_CAP) {
+ 			spk_pitch_shift++;
+ 			synth_printf("%s", spk_str_caps_start);
+ 		}
+ 		synth_putwc_s(ch);
+-		if (ch < 0x100 && IS_CHAR(ch, B_CAP))
++		if (info.type & B_CAP)
+ 			synth_printf("%s", spk_str_caps_stop);
+ 		return;
+ 	}
+ 
+-	cp = spk_characters[ch];
++	cp = info.desc;
+ 	if (!cp) {
+-		pr_info("%s: cp == NULL!\n", __func__);
++		if (ch < 0x100) {
++			pr_info("%s: cp == NULL!\n", __func__);
++			return;
++		}
++		/* Speakup has no description, so let the synthesizer try. */
++		synth_putwc_s(ch);
+ 		return;
+ 	}
+-	if (IS_CHAR(ch, B_CAP)) {
++	if (info.type & B_CAP) {
+ 		spk_pitch_shift++;
+ 		synth_printf("%s %s %s",
+ 			     spk_str_caps_start, cp, spk_str_caps_stop);
+@@ -534,7 +712,7 @@ static void say_phonetic_char(struct vc_data *vc)
+ 		ch &= 0x1f;
+ 		synth_printf("%s\n", phonetic[--ch]);
+ 	} else {
+-		if (ch < 0x100 && IS_CHAR(ch, B_NUM))
++		if (IS_CHAR(ch, B_NUM))
+ 			synth_printf("%s ", spk_msg_get(MSG_NUMBER));
+ 		speak_char(ch);
+ 	}
+@@ -611,15 +789,14 @@ static u_long get_word(struct vc_data *vc)
+ 		synth_printf("%s\n", spk_msg_get(MSG_SPACE));
+ 		return 0;
+ 	} else if (tmpx < vc->vc_cols - 2 &&
+-		   (ch == SPACE || ch == 0 || (ch < 0x100 && IS_WDLM(ch))) &&
++		   (ch == SPACE || ch == 0 || IS_WDLM(ch)) &&
+ 		   get_char(vc, (u_short *)tmp_pos + 1, &temp) > SPACE) {
+ 		tmp_pos += 2;
+ 		tmpx++;
+ 	} else {
+ 		while (tmpx > 0) {
+ 			ch = get_char(vc, (u_short *)tmp_pos - 1, &temp);
+-			if ((ch == SPACE || ch == 0 ||
+-			     (ch < 0x100 && IS_WDLM(ch))) &&
++			if ((ch == SPACE || ch == 0 || IS_WDLM(ch)) &&
+ 			    get_char(vc, (u_short *)tmp_pos, &temp) > SPACE)
+ 				break;
+ 			tmp_pos -= 2;
+@@ -633,8 +810,7 @@ static u_long get_word(struct vc_data *vc)
+ 		tmpx++;
+ 		ch = get_char(vc, (u_short *)tmp_pos, &temp);
+ 		if (ch == SPACE || ch == 0 ||
+-		    (buf[cnt - 1] < 0x100 && IS_WDLM(buf[cnt - 1]) &&
+-		     ch > SPACE))
++		    (IS_WDLM(buf[cnt - 1]) && ch > SPACE))
+ 			break;
+ 		buf[cnt++] = ch;
+ 	}
+@@ -692,7 +868,7 @@ static void say_prev_word(struct vc_data *vc)
+ 		ch = get_char(vc, (u_short *)spk_pos, &temp);
+ 		if (ch == SPACE || ch == 0)
+ 			state = 0;
+-		else if (ch < 0x100 && IS_WDLM(ch))
++		else if (IS_WDLM(ch))
+ 			state = 1;
+ 		else
+ 			state = 2;
+@@ -726,7 +902,7 @@ static void say_next_word(struct vc_data *vc)
+ 		ch = get_char(vc, (u_short *)spk_pos, &temp);
+ 		if (ch == SPACE || ch == 0)
+ 			state = 0;
+-		else if (ch < 0x100 && IS_WDLM(ch))
++		else if (IS_WDLM(ch))
+ 			state = 1;
+ 		else
+ 			state = 2;
+@@ -765,14 +941,17 @@ static void spell_word(struct vc_data *vc)
+ 	if (!get_word(vc))
+ 		return;
+ 	while ((ch = *cp)) {
++		struct spk_char_info info;
++
+ 		if (ch == SPK_UC_WIDE_FILL) {
+ 			cp++;
+ 			continue;
+ 		}
++		info = spk_char_info(ch);
+ 		if (cp != buf)
+ 			synth_printf(" %s ", delay_str[spk_spell_delay]);
+-		/* FIXME: Non-latin1 considered as lower case */
+-		if (ch < 0x100 && IS_CHAR(ch, B_CAP)) {
++		/* FIXME: a code point above Latin-1 is considered lower case */
++		if (info.type & B_CAP) {
+ 			str_cap = spk_str_caps_start;
+ 			if (*spk_str_caps_stop)
+ 				spk_pitch_shift++;
+@@ -785,7 +964,7 @@ static void spell_word(struct vc_data *vc)
+ 			synth_printf("%s", str_cap);
+ 			last_cap = str_cap;
+ 		}
+-		if (ch >= 0x100 || (direct && direct->u.n.value)) {
++		if (direct && direct->u.n.value) {
+ 			synth_putwc_s(ch);
+ 		} else if (this_speakup_key == SPELL_PHONETIC &&
+ 		    ch <= 0x7f && isalpha(ch)) {
+@@ -793,12 +972,17 @@ static void spell_word(struct vc_data *vc)
+ 			cp1 = phonetic[--ch];
+ 			synth_printf("%s", cp1);
+ 		} else {
+-			cp1 = spk_characters[ch];
+-			if (*cp1 == '^') {
+-				synth_printf("%s", spk_msg_get(MSG_CTRL));
+-				cp1++;
++			cp1 = info.desc;
++			if (!cp1) {
++				synth_putwc_s(ch);
++			} else {
++				if (*cp1 == '^') {
++					synth_printf("%s",
++						     spk_msg_get(MSG_CTRL));
++					cp1++;
++				}
++				synth_printf("%s", cp1);
+ 			}
+-			synth_printf("%s", cp1);
+ 		}
+ 		cp++;
+ 	}
+@@ -1160,10 +1344,7 @@ static void spkup_write(const u32 *in_buf, int count)
+ 		 */
+ 		if (ch == SPK_UC_WIDE_FILL)
+ 			continue;
+-		if (ch < 0x100)
+-			char_type = spk_chartab[ch];
+-		else
+-			char_type = ALPHA;
++		char_type = spk_char_type(ch);
+ 		if (ch == old_ch && !(char_type & B_NUM)) {
+ 			if (++rep_count > 2)
+ 				continue;
+@@ -2424,6 +2605,7 @@ static void __exit speakup_exit(void)
+ 			kfree(spk_characters[i]);
+ 	}
+ 
++	spk_free_ext_chars();
+ 	spk_free_user_msgs();
+ }
+ 
+@@ -2439,6 +2621,9 @@ static int __init speakup_init(void)
+ 	spk_initialize_msgs();	/* Initialize arrays for i18n. */
+ 	spk_reset_default_chars();
+ 	spk_reset_default_chartab();
++	err = spk_reset_default_ext_chars();
++	if (err)
++		goto error_ext_chars;
+ 	spk_strlwr(synth_name);
+ 	spk_vars[0].u.n.high = vc->vc_cols;
+ 	for (var = spk_vars; var->var_id != MAXVARS; var++)
+@@ -2524,11 +2709,13 @@ error_virtkeyboard:
+ 	for (i = 0; i < MAXVARS; i++)
+ 		speakup_unregister_var(i);
+ 
++error_ext_chars:
+ 	for (i = 0; i < 256; i++) {
+ 		if (spk_characters[i] != spk_default_chars[i])
+ 			kfree(spk_characters[i]);
+ 	}
+ 
++	spk_free_ext_chars();
+ 	spk_free_user_msgs();
+ 
+ out:
+diff --git a/drivers/accessibility/speakup/speakup.h b/drivers/accessibility/speakup/speakup.h
+index b53c651..983e5e5 100644
+--- a/drivers/accessibility/speakup/speakup.h
++++ b/drivers/accessibility/speakup/speakup.h
+@@ -35,10 +35,44 @@
+ #define B_SYM 0x0800
+ #define B_CAPSYM (B_CAP | B_SYM)
+ 
+-/* FIXME: u16 */
+-#define IS_WDLM(x) (spk_chartab[((u_char)x)] & B_WDLM)
+-#define IS_CHAR(x, type) (spk_chartab[((u_char)x)] & type)
+-#define IS_TYPE(x, type) ((spk_chartab[((u_char)x)] & type) == type)
++/*
++ * spk_chartab[] and spk_characters[] are indexed by the code point itself and
++ * therefore describe Latin-1 only.  A code point above Latin-1 is described by
++ * an entry in the extended character table instead.  The extended character
++ * table is kept sorted by code point and is searched with a binary search.
++ */
++struct spk_ext_char {
++	u32 ch;			/* code point, always at or above 0x100 */
++	u_short type;		/* character class bits, as in spk_chartab */
++	char *desc;		/* spoken description, or NULL for none */
++	bool desc_allocated;	/* desc was allocated and must be freed */
++};
++
++/*
++ * Everything Speakup knows about one code point, gathered by a single table
++ * lookup.  Naming a character needs the class bits and the description
++ * together, so returning both at once keeps one lookup per code point instead
++ * of one lookup per field.
++ */
++struct spk_char_info {
++	char *desc;		/* spoken description, or NULL for none */
++	u_short type;		/* character class bits, as in spk_chartab */
++};
++
++extern struct spk_ext_char *spk_ext_chars;
++extern int spk_ext_chars_used;
++
++int spk_ext_char_index(u32 ch);
++struct spk_char_info spk_char_info(u32 ch);
++u_short spk_char_type(u32 ch);
++int spk_ext_char_set_desc(u32 ch, char *desc);
++int spk_ext_char_set_type(u32 ch, u_short type);
++int spk_reset_default_ext_chars(void);
++void spk_free_ext_chars(void);
++
++#define IS_WDLM(x) (spk_char_type(x) & B_WDLM)
++#define IS_CHAR(x, type) (spk_char_type(x) & type)
++#define IS_TYPE(x, type) ((spk_char_type(x) & type) == type)
+ 
+ int speakup_thread(void *data);
+ void spk_reset_default_chars(void);

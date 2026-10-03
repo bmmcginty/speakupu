@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:22:05 -0400
+Subject: [PATCH 04/12] speakup: stop discarding code points above U+FFFF
+
+`synth_writeu` and `speakup_file_writeu` each tested a decoded value
+against 0x10000 and dropped the value when the test failed, because the
+buffer held a `u16` and could not represent a larger value.  The buffer
+now holds a `u32`, so the test has nothing left to protect and only
+discards supplementary-plane characters.
+
+Drop both tests.  A supplementary-plane character written to
+`/dev/synthu`, or produced by `synth_writeu` on behalf of the virtual
+terminal, now reaches the synth buffer intact.
+
+`synth_utf8_get` already rejects a surrogate code point and a value
+above U+10FFFF, so no value that reaches `synth_buffer_add` here is
+outside Unicode.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/devsynth.c | 3 +--
+ drivers/accessibility/speakup/synth.c    | 3 +--
+ 2 files changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/accessibility/speakup/devsynth.c b/drivers/accessibility/speakup/devsynth.c
+index e75394e..543357f 100644
+--- a/drivers/accessibility/speakup/devsynth.c
++++ b/drivers/accessibility/speakup/devsynth.c
+@@ -74,8 +74,7 @@ static ssize_t speakup_file_writeu(struct file *fp, const char __user *buffer,
+ 				continue;
+ 			}
+ 
+-			if (value < 0x10000)
+-				ubuf[out++] = value;
++			ubuf[out++] = value;
+ 		}
+ 
+ 		count -= bytes;
+diff --git a/drivers/accessibility/speakup/synth.c b/drivers/accessibility/speakup/synth.c
+index 504ff0a..475b5e4 100644
+--- a/drivers/accessibility/speakup/synth.c
++++ b/drivers/accessibility/speakup/synth.c
+@@ -317,8 +317,7 @@ void synth_writeu(const char *buf, size_t count)
+ 			continue;
+ 		}
+ 
+-		if (value < 0x10000)
+-			synth_buffer_add(value);
++		synth_buffer_add(value);
+ 	}
+ 
+ 	synth_start();

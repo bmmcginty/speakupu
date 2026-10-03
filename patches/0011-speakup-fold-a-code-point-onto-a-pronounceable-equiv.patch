@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:29:13 -0400
+Subject: [PATCH 11/12] speakup: fold a code point onto a pronounceable
+ equivalent
+
+A speech synthesizer can pronounce some characters only in another form.
+A fullwidth digit is the clearest case: a synthesizer that speaks U+0030
+as "zero" produces nothing at all for U+FF10, even though the two
+characters mean the same digit.  Naming such a character instead of
+folding it would spell out a run of digits one name at a time, which
+loses the number.
+
+Give each extended table entry an optional fold target, which is the
+code point to hand to the synthesizer in place of the entry's own code
+point.  `spk_char_info.fold` reports the fold target, and reports the
+requested code point itself when the entry defines no fold target, so a
+caller never tests for the absence of a fold target.
+
+Pass `spk_char_info.fold` at every call to `synth_putwc_s` that hands a
+character to the synthesizer:
+
+  - the direct branch of `speak_char`
+  - the no-description branch of `speak_char`
+  - the direct branch of `spell_word`
+  - the no-description branch of `spell_word`
+  - the B_ALPHA, B_NUM and SYNTH_OK branches of `spkup_write`
+
+Folding in all seven places rather than only in `spkup_write` keeps the
+spoken result the same whether a character arrives from console output
+or from a screen review command.
+
+`spk_ext_char_insert` assigns the new field explicitly.  `krealloc_array`
+does not zero the slots it adds, and the sort loop leaves a copy of a
+neighbouring entry in the insert slot, so no field of a new entry may be
+relied on to be zero.
+
+This commit defines no fold target, so this commit changes no spoken
+output.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ drivers/accessibility/speakup/main.c    | 32 +++++++++++++++++--------
+ drivers/accessibility/speakup/speakup.h |  8 ++++---
+ 2 files changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/accessibility/speakup/main.c b/drivers/accessibility/speakup/main.c
+index 85d4e32..80fcaa8 100644
+--- a/drivers/accessibility/speakup/main.c
++++ b/drivers/accessibility/speakup/main.c
+@@ -264,10 +264,16 @@ int spk_ext_char_index(u32 ch)
+ 	return -1;
+ }
+ 
+-/* Describe ch with a single table lookup. */
++/*
++ * Describe ch with a single table lookup.  spk_char_info.fold is the code
++ * point to hand to the synthesizer, because a code point the synthesizer
++ * cannot pronounce folds onto an equivalent the synthesizer can pronounce.
++ * spk_char_info.fold equals ch when ch needs no folding, so a caller never
++ * has to test for the absence of a fold target.
++ */
+ struct spk_char_info spk_char_info(u32 ch)
+ {
+-	struct spk_char_info info = { .desc = NULL, .type = ALPHA };
++	struct spk_char_info info = { .desc = NULL, .fold = ch, .type = ALPHA };
+ 	int index;
+ 
+ 	if (ch < 0x100) {
+@@ -280,6 +286,8 @@ struct spk_char_info spk_char_info(u32 ch)
+ 		return info;
+ 	info.desc = spk_ext_chars[index].desc;
+ 	info.type = spk_ext_chars[index].type;
++	if (spk_ext_chars[index].fold)
++		info.fold = spk_ext_chars[index].fold;
+ 	return info;
+ }
+ 
+@@ -340,6 +348,7 @@ static int spk_ext_char_insert(u32 ch)
+ 	spk_ext_chars[i].ch = ch;
+ 	spk_ext_chars[i].type = ALPHA;
+ 	spk_ext_chars[i].desc = NULL;
++	spk_ext_chars[i].fold = 0;
+ 	spk_ext_chars[i].desc_allocated = false;
+ 	spk_ext_chars_used++;
+ 	return i;
+@@ -602,7 +611,7 @@ static void speak_char(u32 ch)
+ 			spk_pitch_shift++;
+ 			synth_printf("%s", spk_str_caps_start);
+ 		}
+-		synth_putwc_s(ch);
++		synth_putwc_s(info.fold);
+ 		if (info.type & B_CAP)
+ 			synth_printf("%s", spk_str_caps_stop);
+ 		return;
+@@ -615,7 +624,7 @@ static void speak_char(u32 ch)
+ 			return;
+ 		}
+ 		/* Speakup has no description, so let the synthesizer try. */
+-		synth_putwc_s(ch);
++		synth_putwc_s(info.fold);
+ 		return;
+ 	}
+ 	if (info.type & B_CAP) {
+@@ -965,7 +974,7 @@ static void spell_word(struct vc_data *vc)
+ 			last_cap = str_cap;
+ 		}
+ 		if (direct && direct->u.n.value) {
+-			synth_putwc_s(ch);
++			synth_putwc_s(info.fold);
+ 		} else if (this_speakup_key == SPELL_PHONETIC &&
+ 		    ch <= 0x7f && isalpha(ch)) {
+ 			ch &= 0x1f;
+@@ -974,7 +983,7 @@ static void spell_word(struct vc_data *vc)
+ 		} else {
+ 			cp1 = info.desc;
+ 			if (!cp1) {
+-				synth_putwc_s(ch);
++				synth_putwc_s(info.fold);
+ 			} else {
+ 				if (*cp1 == '^') {
+ 					synth_printf("%s",
+@@ -1329,6 +1338,8 @@ static void spkup_write(const u32 *in_buf, int count)
+ 
+ 	spk_keydown = 0;
+ 	while (count--) {
++		struct spk_char_info info;
++
+ 		if (cursor_track == read_all_mode) {
+ 			/* Insert Sentence Index */
+ 			if ((in_buf == sentmarks[bn][currsentence]) &&
+@@ -1344,7 +1355,8 @@ static void spkup_write(const u32 *in_buf, int count)
+ 		 */
+ 		if (ch == SPK_UC_WIDE_FILL)
+ 			continue;
+-		char_type = spk_char_type(ch);
++		info = spk_char_info(ch);
++		char_type = info.type;
+ 		if (ch == old_ch && !(char_type & B_NUM)) {
+ 			if (++rep_count > 2)
+ 				continue;
+@@ -1364,10 +1376,10 @@ static void spkup_write(const u32 *in_buf, int count)
+ 		} else if (char_type & B_ALPHA) {
+ 			if ((synth_flags & SF_DEC) && (last_type & PUNC))
+ 				synth_buffer_add(SPACE);
+-			synth_putwc_s(ch);
++			synth_putwc_s(info.fold);
+ 		} else if (char_type & B_NUM) {
+ 			rep_count = 0;
+-			synth_putwc_s(ch);
++			synth_putwc_s(info.fold);
+ 		} else if (char_type & spk_punc_mask) {
+ 			speak_char(ch);
+ 			char_type &= ~PUNC;	/* for dec nospell processing */
+@@ -1380,7 +1392,7 @@ static void spkup_write(const u32 *in_buf, int count)
+ 			 * repeats on you don't get nothing repeated count
+ 			 */
+ 			if (ch != old_ch)
+-				synth_putwc_s(ch);
++				synth_putwc_s(info.fold);
+ 			else
+ 				rep_count = 0;
+ 		} else {
+diff --git a/drivers/accessibility/speakup/speakup.h b/drivers/accessibility/speakup/speakup.h
+index fdf7c99..3f237ba 100644
+--- a/drivers/accessibility/speakup/speakup.h
++++ b/drivers/accessibility/speakup/speakup.h
+@@ -46,17 +46,19 @@ struct spk_ext_char {
+ 	u32 ch;			/* code point, always at or above 0x100 */
+ 	u_short type;		/* character class bits, as in spk_chartab */
+ 	char *desc;		/* spoken description, or NULL for none */
++	u32 fold;		/* code point to send instead, or 0 for ch */
+ 	bool desc_allocated;	/* desc was allocated and must be freed */
+ };
+ 
+ /*
+  * Everything Speakup knows about one code point, gathered by a single table
+- * lookup.  Naming a character needs the class bits and the description
+- * together, so returning both at once keeps one lookup per code point instead
+- * of one lookup per field.
++ * lookup.  Naming a character needs the class bits, the description and the
++ * fold target together, so returning all three at once keeps one lookup per
++ * code point instead of one lookup per field.
+  */
+ struct spk_char_info {
+ 	char *desc;		/* spoken description, or NULL for none */
++	u32 fold;		/* code point to send to the synthesizer */
+ 	u_short type;		/* character class bits, as in spk_chartab */
+ };
+ 

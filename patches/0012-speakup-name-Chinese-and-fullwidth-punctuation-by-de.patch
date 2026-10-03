@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brandon McGinty <brandon.mcginty@gmail.com>
+Date: Fri, 2 Oct 2026 19:30:37 -0400
+Subject: [PATCH 12/12] speakup: name Chinese and fullwidth punctuation by
+ default
+
+A speech synthesizer produces no sound for an isolated Chinese
+punctuation mark, so reviewing Chinese text one character at a time was
+silent at every punctuation mark.  The extended character table and the
+fold mechanism are in place but empty, so nothing uses either yet.
+
+Populate the table with 76 entries covering the code points a reader of
+Chinese meets: the general punctuation at U+2013 through U+203B, the CJK
+symbols and punctuation at U+3000 through U+3030, and the fullwidth and
+halfwidth forms at U+FF01 through U+FF65.
+
+The class bits mirror the class bits that `default_chartab` gives the
+matching ASCII punctuation, so `punc_level` and `reading_punc` treat
+Chinese punctuation exactly as they already treat Latin punctuation.
+
+Chinese text has no spaces, so without B_WDLM nothing would end a word
+and word navigation would traverse a whole line.  The marks that end a
+Chinese clause or sentence therefore carry A_PUNC_WDLM, which names them
+at punctuation level "all" and ends a word: U+3001, U+3002, U+FF01,
+U+FF0C, U+FF1A, U+FF1B and U+FF1F.
+
+The ten fullwidth digits U+FF10 through U+FF19 carry a fold target onto
+the matching ASCII digit, so a run of fullwidth digits is spoken as one
+number rather than as a sequence of digit names.
+
+The table must stay sorted by code point, because `spk_ext_char_index`
+bisects it.
+
+A reader who wants different wording, or a different class for any of
+these code points, can override both through
+`/sys/accessibility/speakup/i18n/ext_characters` and
+`/sys/accessibility/speakup/i18n/ext_chartab`.
+
+Rewrite section 14.3 of `spkguide.txt`, which said that Speakup supports
+Western European languages only and that support for anything else was a
+work in progress.  The replacement states what now works, which device
+carries whole characters, that the hardware synthesizer drivers still
+carry Latin-1 only, and that a double-width character is reviewed as one
+character.
+
+Signed-off-by: Brandon McGinty <brandon.mcginty@gmail.com>
+---
+ Documentation/admin-guide/spkguide.txt |  23 ++++-
+ drivers/accessibility/speakup/main.c   | 111 ++++++++++++++++++++++++-
+ 2 files changed, 127 insertions(+), 7 deletions(-)
+
+diff --git a/Documentation/admin-guide/spkguide.txt b/Documentation/admin-guide/spkguide.txt
+index dee6e02..408204d 100644
+--- a/Documentation/admin-guide/spkguide.txt
++++ b/Documentation/admin-guide/spkguide.txt
+@@ -1171,11 +1171,26 @@ administrator (or every user) will have to run the first steps until speakupconf
+ save, choosing the appropriate language, in every user's home directory. Every
+ user will then be able to do speakupconf load, Speakup will load his own settings.
+ 
+-14.3.  No Support for Non-Western-European Languages
++14.3.  Languages Outside the Western European Family
+ 
+-As of the current release, Speakup only supports Western European languages.
+-Support for the extended characters used by languages outside of the Western
+-European family of languages is a work in progress.
++Speakup carries the full range of Unicode characters, so a language outside
++the Western European family can be read, provided that the synthesizer in use
++can speak it.  The console must be in UTF-8 mode, and the synthesizer must be
++reached through a device that carries whole characters, which means
++/dev/softsynthu rather than /dev/softsynth.  The hardware synthesizer drivers
++still carry the first 256 characters only.
++
++A character that Speakup does not name is passed to the synthesizer as it
++stands, which is the right behaviour for a letter or an ideograph.  A
++punctuation mark is different: a synthesizer usually produces no sound for a
++punctuation mark outside its own script, so such a mark has to be named before
++it can be heard.  Speakup names the Chinese and fullwidth punctuation marks by
++default, and section 12.1 describes how to name a mark from any other script.
++
++Chinese, Japanese and Korean characters each occupy two screen columns.  The
++reading cursor treats such a character as one character rather than two, so
++moving left and right by character, and reviewing a character under the
++cursor, both behave as they do for a single-column character.
+ 
+ 15.  Using Speakup's Windowing Capability
+ 
+diff --git a/drivers/accessibility/speakup/main.c b/drivers/accessibility/speakup/main.c
+index 80fcaa8..71ecc25 100644
+--- a/drivers/accessibility/speakup/main.c
++++ b/drivers/accessibility/speakup/main.c
+@@ -229,6 +229,106 @@ static u_short default_chartab[256] = {
+ 	ALPHA, ALPHA, ALPHA, ALPHA, ALPHA, ALPHA, ALPHA, ALPHA	/* 248-255 */
+ };
+ 
++/*
++ * Code points above Latin-1 that Speakup names and classifies by default.
++ *
++ * A speech synthesizer produces no sound for an isolated Chinese punctuation
++ * mark, so reviewing Chinese text one character at a time is silent unless
++ * Speakup names the punctuation mark itself.  The class bits mirror the class
++ * bits that default_chartab gives to the matching ASCII punctuation, so
++ * punc_level and reading_punc treat Chinese punctuation exactly as they treat
++ * Latin punctuation.
++ *
++ * Chinese text has no spaces, so nothing would end a word without B_WDLM on
++ * the marks that end a Chinese clause or sentence.  Those marks therefore
++ * carry A_PUNC_WDLM, which keeps them named at punctuation level "all" while
++ * also ending a word.
++ *
++ * A speech synthesizer cannot pronounce a fullwidth digit, so a fullwidth
++ * digit folds onto the matching ASCII digit.  Folding keeps a run of fullwidth
++ * digits readable as one number, which naming each digit would not.
++ *
++ * This table must stay sorted by code point.
++ */
++static const struct spk_ext_char spk_default_ext_chars[] = {
++	{ 0x2013, A_PUNC, "en dash" },
++	{ 0x2014, A_PUNC, "em dash" },
++	{ 0x2015, A_PUNC, "horizontal bar" },
++	{ 0x2018, A_PUNC, "left tick" },
++	{ 0x2019, A_PUNC, "right tick" },
++	{ 0x201c, PUNC, "left quote" },
++	{ 0x201d, PUNC, "right quote" },
++	{ 0x2026, A_PUNC, "ellipsis" },
++	{ 0x203b, PUNC, "reference mark" },
++	{ 0x3000, WDLM, "wide space" },
++	{ 0x3001, A_PUNC_WDLM, "ideographic comma" },
++	{ 0x3002, A_PUNC_WDLM, "ideographic dot" },
++	{ 0x3003, PUNC, "ditto" },
++	{ 0x3008, PUNC, "left angle" },
++	{ 0x3009, PUNC, "right angle" },
++	{ 0x300a, PUNC, "left double angle" },
++	{ 0x300b, PUNC, "right double angle" },
++	{ 0x300c, PUNC, "left corner" },
++	{ 0x300d, PUNC, "right corner" },
++	{ 0x300e, PUNC, "left white corner" },
++	{ 0x300f, PUNC, "right white corner" },
++	{ 0x3010, PUNC, "left lenticular" },
++	{ 0x3011, PUNC, "right lenticular" },
++	{ 0x3014, PUNC, "left tortoise" },
++	{ 0x3015, PUNC, "right tortoise" },
++	{ 0x3016, PUNC, "left white lenticular" },
++	{ 0x3017, PUNC, "right white lenticular" },
++	{ 0x301c, PUNC, "wave dash" },
++	{ 0x3030, PUNC, "wavy dash" },
++	{ 0xff01, A_PUNC_WDLM, "wide bang" },
++	{ 0xff02, PUNC, "wide quote" },
++	{ 0xff03, PUNC, "wide number" },
++	{ 0xff04, PUNC, "wide dollar" },
++	{ 0xff05, PUNC, "wide percent" },
++	{ 0xff06, PUNC, "wide and" },
++	{ 0xff07, A_PUNC, "wide tick" },
++	{ 0xff08, PUNC, "wide left paren" },
++	{ 0xff09, PUNC, "wide right paren" },
++	{ 0xff0a, PUNC, "wide star" },
++	{ 0xff0b, PUNC, "wide plus" },
++	{ 0xff0c, A_PUNC_WDLM, "wide comma" },
++	{ 0xff0d, A_PUNC, "wide dash" },
++	{ 0xff0e, A_PUNC, "wide dot" },
++	{ 0xff0f, PUNC, "wide slash" },
++	{ 0xff10, NUM, "zero", '0' },
++	{ 0xff11, NUM, "one", '1' },
++	{ 0xff12, NUM, "two", '2' },
++	{ 0xff13, NUM, "three", '3' },
++	{ 0xff14, NUM, "four", '4' },
++	{ 0xff15, NUM, "five", '5' },
++	{ 0xff16, NUM, "six", '6' },
++	{ 0xff17, NUM, "seven", '7' },
++	{ 0xff18, NUM, "eight", '8' },
++	{ 0xff19, NUM, "nine", '9' },
++	{ 0xff1a, A_PUNC_WDLM, "wide colon" },
++	{ 0xff1b, A_PUNC_WDLM, "wide semmy" },
++	{ 0xff1c, PUNC, "wide less" },
++	{ 0xff1d, PUNC, "wide equals" },
++	{ 0xff1e, PUNC, "wide greater" },
++	{ 0xff1f, A_PUNC_WDLM, "wide question" },
++	{ 0xff20, PUNC, "wide at" },
++	{ 0xff3b, PUNC, "wide left bracket" },
++	{ 0xff3c, PUNC, "wide backslash" },
++	{ 0xff3d, PUNC, "wide right bracket" },
++	{ 0xff3e, PUNC, "wide caret" },
++	{ 0xff3f, PUNC, "wide line" },
++	{ 0xff40, PUNC, "wide accent" },
++	{ 0xff5b, PUNC, "wide left brace" },
++	{ 0xff5c, PUNC, "wide bar" },
++	{ 0xff5d, PUNC, "wide right brace" },
++	{ 0xff5e, PUNC, "wide tilde" },
++	{ 0xff61, A_PUNC, "half width ideographic dot" },
++	{ 0xff62, PUNC, "half width left corner" },
++	{ 0xff63, PUNC, "half width right corner" },
++	{ 0xff64, A_PUNC, "half width ideographic comma" },
++	{ 0xff65, PUNC, "half width middle dot" },
++};
++
+ /*
+  * The extended character table describes a code point at or above 0x100, which
+  * spk_chartab[] and spk_characters[] cannot describe because both are indexed
+@@ -397,16 +497,21 @@ void spk_free_ext_chars(void)
+  */
+ int spk_reset_default_ext_chars(void)
+ {
++	int count = ARRAY_SIZE(spk_default_ext_chars);
++	int size = ALIGN(count, SPK_EXT_CHARS_CHUNK);
+ 	struct spk_ext_char *table;
++	int i;
+ 
+-	table = kcalloc(SPK_EXT_CHARS_CHUNK, sizeof(*table), GFP_ATOMIC);
++	table = kcalloc(size, sizeof(*table), GFP_ATOMIC);
+ 	if (!table)
+ 		return -ENOMEM;
+ 
+ 	spk_free_ext_chars();
++	for (i = 0; i < count; i++)
++		table[i] = spk_default_ext_chars[i];
+ 	spk_ext_chars = table;
+-	spk_ext_chars_used = 0;
+-	spk_ext_chars_size = SPK_EXT_CHARS_CHUNK;
++	spk_ext_chars_used = count;
++	spk_ext_chars_size = size;
+ 	return 0;
+ }
+ 
